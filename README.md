@@ -6,11 +6,11 @@ Built with [Telethon](https://docs.telethon.dev/).
 
 ## How it works
 
-The script logs in as **your own Telegram account** (not a bot account), so it can read any group or channel you are a member of. While it is running, each new message from a source chat is forwarded to your target group. Messages posted while it is not running are not forwarded.
+The script logs in as **your own Telegram account** (not a bot account), so it can read any group or channel you are a member of. While it is running, each new message from a source chat is forwarded to your target group, and albums arrive as one album. Messages posted while it is not running are not forwarded. See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
 
 ## Setup
 
-1. Install Python 3.12 and the dependencies:
+1. Install Python 3.12 or 3.13 and the dependencies:
 
    ```
    pip install -r requirements.txt
@@ -59,6 +59,7 @@ All settings live in `.env`:
 ## Notes
 
 - Chats that have "Restrict saving content" turned on cannot be forwarded from.
+- `TARGET_GROUP_ID` must not also be in `SOURCE_GROUP_IDS`; the script refuses to start, because that would forward messages in an endless loop.
 - The script acts as your personal account, so use it within [Telegram's Terms of Service](https://telegram.org/tos) and respect the owners of the content you forward.
 
 ## License

@@ -1,0 +1,14 @@
+# Personal settings and secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Telegram login sessions (anyone with these files can use your account)
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

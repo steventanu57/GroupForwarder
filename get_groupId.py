@@ -13,12 +13,14 @@ api_hash = os.getenv("API_HASH", "").strip()  # your api_hash, set in .env
 if not api_id or not api_hash:
     raise SystemExit("Missing API_ID or API_HASH in .env (see .env.example)")
 
-client = TelegramClient(str(BASE_DIR / 'groupid'), int(api_id), api_hash)
+client = TelegramClient(str(BASE_DIR / "groupid"), int(api_id), api_hash)
+
 
 async def main():
     print("Fetching all dialogs...\n")
     async for dialog in client.iter_dialogs():
         print(f"{dialog.name}: {dialog.id}")
+
 
 with client:
     client.loop.run_until_complete(main())

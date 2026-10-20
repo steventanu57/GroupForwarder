@@ -58,6 +58,9 @@ All settings live in `.env`:
 
 ## Notes
 
+- On start, the forwarder lists the chats it listens to. It warns about any source chat that isn't in your chat list, for example a typo in the ID or a chat you have left. Rejoin the chat and restart the forwarder to forward from it again.
+- Each forwarded message is logged with the time, the source chat, the target group and the sender. If a forward fails, the log says why, and the forwarder keeps running.
+- If your internet drops, it keeps trying to reconnect until it's back. Messages posted while it was disconnected may be missed.
 - Chats that have "Restrict saving content" turned on cannot be forwarded from.
 - `TARGET_GROUP_ID` must not also be in `SOURCE_GROUP_IDS`; the script refuses to start, because that would forward messages in an endless loop.
 - The script acts as your personal account, so use it within [Telegram's Terms of Service](https://telegram.org/tos) and respect the owners of the content you forward.

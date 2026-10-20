@@ -1,0 +1,61 @@
+# GroupForwarder settings (optional)
+#
+# To use it: copy this file to forwarder_config.toml in the same folder, change what you want,
+# save, and restart the forwarder. Without forwarder_config.toml the forwarder works as before:
+# everything from SOURCE_GROUP_IDS (.env) goes to TARGET_GROUP_ID (.env).
+#
+# forwarder_config.toml is ignored by git (it holds your chat IDs), like .env.
+# Every value below is the default, so copying this file as it is changes nothing.
+# Lines starting with # are comments. Text goes in "quotes"; true/false and numbers don't.
+# A misspelled setting stops the forwarder with a message saying which one.
+
+[options]
+# Don't forward what you post yourself in a source chat.
+skip_own_messages = false
+
+# On start, forward what the source chats posted while the forwarder was off:
+# the newest messages from the last catch_up_hours, at most catch_up_max_per_chat per chat.
+# The first start with this on only remembers where each chat is (in forwarder_state.json).
+catch_up = false
+catch_up_hours = 6
+catch_up_max_per_chat = 20
+
+# Handle messages one at a time, in the order they arrive. Slower when many arrive at once.
+strict_order = false
+
+# Send a copy with the source chat's name on top, instead of Telegram's "Forwarded from".
+# Chats with "Restrict saving content" are never copied (or forwarded).
+copy_mode = false
+
+# Don't send the same post twice to the same target within duplicate_window_hours
+# (for example one channel post shared in several of your source chats).
+skip_duplicates = false
+duplicate_window_hours = 24
+
+# Control the forwarder from your Saved Messages: /status, /pause, /resume, /sources, /help
+commands = true
+
+# A daily "still running" message in your Saved Messages at this local time (24-hour clock),
+# with what was forwarded and what failed since the last one.
+daily_summary = false
+daily_summary_time = "09:00"
+
+[filters]
+# Apply to every route below, and to SOURCE_GROUP_IDS -> TARGET_GROUP_ID.
+# Keywords ignore upper/lower case and also match inside words ("btc" matches "#BTCUSD").
+include_keywords = []    # Only forward messages containing at least one of these, e.g. ["btc", "eth"]
+exclude_keywords = []    # Never forward messages containing any of these, e.g. ["giveaway"]
+media_only = false       # Only forward messages with a photo, video, file, ...
+skip_bots = false        # Don't forward messages sent by bots
+skip_reposts = false     # Don't forward messages that are themselves forwarded from elsewhere
+
+# Extra routes, on top of SOURCE_GROUP_IDS -> TARGET_GROUP_ID in .env.
+# Remove the # at the start of the lines to use one. Copy the block for more routes.
+# Find chat IDs with: python group_forwarder.py --list-chats
+#
+# [[routes]]
+# sources = [-1001111111111, -1002222222222]   # chats to forward from
+# target = -1003333333333                      # where they go (must not also be a source anywhere)
+# topic = 12                                   # optional: a forum topic in the target (its number)
+# include_keywords = ["btc"]                   # optional: this route's own filters; any setting
+#                                              # from [filters] can be given here, and replaces it

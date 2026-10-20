@@ -7,6 +7,12 @@
 *.session
 *.session-journal
 
+# Your forwarder settings (chat IDs) and files the forwarder writes while running
+forwarder_config.toml
+forwarder_state.json
+forwarder.log
+group_forwarder.lock
+
 # Python
 __pycache__/
 *.py[cod]

@@ -59,6 +59,10 @@ class RecordingClient:
     protected: ClassVar[set] = set()  # Chats with "Restrict saving content"
     authorized: ClassVar[bool] = True
     history: ClassVar[dict] = {}  # Chat ID -> messages, oldest first (for catch-up)
+    forums: ClassVar[
+        dict
+    ] = {}  # Chat ID -> [(topic number, title)] for groups with topics
+    names: ClassVar[dict] = {}  # Chat ID -> name, replacing CHAT_NAMES for one test
     created: ClassVar[list] = []  # Every client made, also when the script stops early
 
     def __init__(self, session, api_id, api_hash, **kwargs):
@@ -79,12 +83,18 @@ class RecordingClient:
     async def is_user_authorized(self):
         return self.authorized
 
-    def start(self):
+    def start(self, **prompts):
         self.calls.append("start")
+        self.prompts = prompts  # phone / code_callback / password: what the login asks
         return self
 
-    async def disconnect(self):
+    def disconnect(self):
+        # Like Telethon's: with no event loop running it disconnects right away and returns None;
+        # inside a running loop it returns something to await
         self.calls.append("disconnect")
+        if self.loop.is_running():
+            return asyncio.sleep(0)
+        return None
 
     async def get_dialogs(self, *a, **k):
         self.calls.append("get_dialogs")
@@ -92,12 +102,16 @@ class RecordingClient:
             SimpleNamespace(
                 id=chat_id,
                 name=name,
-                entity=SimpleNamespace(noforwards=chat_id in self.protected),
+                entity=SimpleNamespace(
+                    id=chat_id,
+                    noforwards=chat_id in self.protected,
+                    forum=chat_id in self.forums,
+                ),
                 is_channel=True,
-                is_group=chat_id == TARGET,
+                is_group=chat_id in (TARGET, TARGET2),
                 is_user=False,
             )
-            for chat_id, name in CHAT_NAMES.items()
+            for chat_id, name in {**CHAT_NAMES, **self.names}.items()
             if chat_id not in self.unknown_peers | self.left_chats
         ]
 
@@ -118,6 +132,16 @@ class RecordingClient:
 
     async def __call__(self, request):
         self.calls.append(("raw", request))
+        if type(request).__name__ == "GetForumTopicsRequest":
+            chat = (
+                getattr(request, "peer", None) or request.channel
+            )  # Telethon 1.45 / 1.41
+            topics = self.forums[chat.id]
+            return SimpleNamespace(
+                count=len(topics),
+                topics=[SimpleNamespace(id=n, title=t) for n, t in topics],
+            )
+        return None
 
     async def get_messages(self, chat, limit=1):
         return list(reversed(self.history.get(chat, [])))[:limit]
@@ -141,10 +165,11 @@ class RecordingClient:
 
     def command(self, text):
         """Runs the Saved Messages command handler as Telethon would for this text."""
-        builder, func = next((b, f) for b, f in self.handlers if b.chats == "me")
-        event = SimpleNamespace(pattern_match=builder.pattern(text))
-        assert event.pattern_match, f"{text} is not a command"
-        handle(self, func, event)
+        for builder, func in self.handlers:
+            if builder.chats == "me" and builder.pattern(text):
+                handle(self, func, SimpleNamespace(pattern_match=builder.pattern(text)))
+                return
+        raise AssertionError(f"{text} is not a command")
 
     def printed(self):
         return [c[1] for c in self.calls if c[0] == "print"]
@@ -187,6 +212,8 @@ def run_script(
     history=None,
     protected=(),
     lock_held=False,
+    forums=None,
+    names=None,
 ):
     """Runs a fresh copy of the script in a new temporary folder (its BASE_DIR) and returns the client.
     config: text for forwarder_config.toml; files: {name: text} for other files in that folder."""
@@ -203,6 +230,8 @@ def run_script(
     RecordingClient.protected = set(protected)
     RecordingClient.authorized = authorized
     RecordingClient.history = history or {}
+    RecordingClient.forums = forums or {}
+    RecordingClient.names = names or {}
     RecordingClient.created = []
     lock = hold_lock(folder / "group_forwarder.lock") if lock_held else None
 
@@ -401,6 +430,13 @@ def test_emoji_name_printed_to_a_log_file(tmp_path):
     emoji_survives_log_file(probe, tmp_path)
 
 
+def groupid_copy(folder):
+    # A copy in a temporary folder, so it never reads your .env (it loads the .env next to itself)
+    copy = folder / "get_groupId.py"
+    shutil.copy(gf_dir() / "get_groupId.py", copy)
+    return copy
+
+
 def test_get_groupid_emoji_name_printed_to_a_log_file(tmp_path):
     # get_groupId.py > chats.txt used to stop at the first chat with an emoji in its name
     probe = tmp_path / "zz_probe.py"
@@ -410,11 +446,13 @@ def test_get_groupid_emoji_name_printed_to_a_log_file(tmp_path):
         "    def __init__(self, *a, **k): self.loop = asyncio.new_event_loop()\n"
         "    def __enter__(self): return self\n"
         "    def __exit__(self, *e): return False\n"
+        "    def start(self, **prompts): return self\n"
+        "    def disconnect(self): return None\n"
         "    async def iter_dialogs(self):\n"
         "        for name, i in [('zz-\\U0001f680 Calls', -1001), ('zz-After', -1002)]:\n"
         "            yield types.SimpleNamespace(name=name, id=i)\n"
         "telethon.TelegramClient = Fake\n"
-        f"path = {str(gf_dir() / 'get_groupId.py')!r}\n"
+        f"path = {str(groupid_copy(tmp_path))!r}\n"
         "exec(compile(open(path, encoding='utf-8').read(), path, 'exec'), {'__file__': path, '__name__': '__main__'})\n",
         encoding="utf-8",
     )
@@ -990,3 +1028,214 @@ def test_empty_config_file_is_reported_as_in_use():  # Config file
         "Settings: forwarder_config.toml (nothing changed" in line
         for line in client.printed()
     ), client.printed()
+
+
+# ---------- found by the end-to-end test (tests/e2e: real Telethon, simulated Telegram) ----------
+
+
+def test_list_chats_ends_without_an_error():  # G24
+    # Telethon's disconnect() finishes by itself when no event loop is running (and returns None)
+    with pytest.raises(SystemExit) as stopped:
+        run_script(
+            argv=["--list-chats"], env={"SOURCE_GROUP_IDS": "", "TARGET_GROUP_ID": ""}
+        )
+    assert stopped.value.code == 0
+    assert "disconnect" in last_client().calls
+
+
+def test_copy_refused_by_the_target_is_not_forwarded_instead():  # G25
+    client = run_script(config="[options]\ncopy_mode = true\n")
+
+    async def cant_write(*a, **k):
+        raise errors.ChatWriteForbiddenError(request=None)
+
+    client.send_message = cant_write
+    send(client, msg_event())
+    assert client.forwards() == []  # No second try that would fail the same way
+    printed = client.printed()
+    assert not any("forwarding it instead" in line for line in printed)
+    assert any(
+        "Could not forward message from zz-Source A: ChatWriteForbiddenError" in line
+        for line in printed
+    ), printed
+
+
+def test_sources_command_marks_chats_not_in_your_list():  # G26
+    client = run_script(left_chats={SOURCE_B})
+    client.command("/sources")
+    (reply,) = client.saved_messages()
+    assert f"zz-Source A, {SOURCE_B} (not in your chat list) → zz-Target" in reply
+
+
+# ---------- easier setup: finding IDs, clear questions and messages, a safe log (U1-U4, U11, U12) ----------
+
+
+def test_chats_command_lists_chats_and_what_they_are_used_for():  # U1
+    client = run_script()
+    client.command("/chats")
+    (reply,) = client.saved_messages()
+    assert f"zz-Source A: {SOURCE_A} (channel) · forwarding from it" in reply
+    assert f"zz-Target: {TARGET} (group) · forwarding to it" in reply
+    assert f"zz-Source C: {SOURCE_C} (channel)\n" in reply  # Not used yet
+    assert "SOURCE_GROUP_IDS" in reply and "/help" in reply
+
+
+def test_chats_command_finds_chats_by_part_of_the_name():  # U1
+    client = run_script()
+    client.command("/chats source b")
+    (reply,) = client.saved_messages()
+    assert f"zz-Source B: {SOURCE_B}" in reply and "zz-Source A" not in reply
+    client.command("/chats zz-nothing")
+    assert 'No chat has "zz-nothing" in its name' in client.saved_messages()[-1]
+
+
+def test_long_replies_are_split_and_sent_as_plain_text():  # U1
+    many = {-1004000000000 - i: f"zz-chat __{i}__ " + "x" * 40 for i in range(150)}
+    client = run_script(names=many)
+    client.command("/chats")
+    sent = [c for c in client.calls if c[0] == "send" and c[1] == "me"]
+    assert len(sent) >= 2 and all(len(c[2]) <= 4096 for c in sent)
+    assert all(c[3].get("parse_mode") is None for c in sent)  # __7__ stays as it is
+    everything = "\n".join(c[2] for c in sent)
+    assert all(str(chat_id) in everything for chat_id in many)
+
+
+def test_topics_command_lists_topic_numbers():  # U12
+    client = run_script(forums={TARGET2: [(1, "General"), (45, "zz-Signals")]})
+    client.command(f"/topics {TARGET2}")
+    client.command("/topics target 2")  # Part of the name works too
+    client.command("/chats target 2")
+    by_id, by_name, chats = client.saved_messages()
+    assert "Topics in zz-Target 2" in by_id and "45: zz-Signals" in by_id
+    assert "1: General" in by_id and "topic = " in by_id  # And how to use the number
+    assert "45: zz-Signals" in by_name
+    assert f"zz-Target 2: {TARGET2} (group with topics)" in chats
+
+
+def test_topics_command_explains_what_it_needs():  # U12
+    client = run_script(forums={TARGET2: [(45, "zz-Signals")]})
+    for text in (
+        "/topics",
+        f"/topics {SOURCE_A}",
+        "/topics zz-nothing",
+        "/topics zz-source",
+    ):
+        client.command(text)
+    asked, not_forum, no_match, several = client.saved_messages()
+    assert "Send /topics followed by" in asked
+    assert "zz-Source A has no topics" in not_forum
+    assert 'No chat matches "zz-nothing"' in no_match
+    assert "Several chats match" in several and str(SOURCE_B) in several
+
+
+def test_help_explains_how_to_add_a_chat():  # U2
+    client = run_script()
+    client.command("/help")
+    (reply,) = client.saved_messages()
+    for part in (
+        "/chats",
+        "/topics",
+        "SOURCE_GROUP_IDS",
+        ".env",
+        "restart",
+        "forwarder_config.toml",
+    ):
+        assert part in reply, part
+
+
+def test_startup_points_to_help_chats_and_topics():  # U2
+    printed = run_script().printed()
+    assert any(
+        "send /help" in line and "/chats" in line and "/topics" in line
+        for line in printed
+    ), printed
+    with pytest.raises(SystemExit):
+        run_script(
+            argv=["--list-chats"], env={"SOURCE_GROUP_IDS": "", "TARGET_GROUP_ID": ""}
+        )
+    assert any("/chats" in line for line in last_client().printed())
+
+
+def answers_to(prompts):
+    asked = []
+
+    def answer(text):
+        asked.append(text)
+        return "zz"
+
+    with (
+        mock.patch("builtins.input", answer),
+        mock.patch("getpass.getpass", answer),
+    ):
+        for question in ("phone", "code_callback", "password"):
+            prompts[question]()
+    return asked
+
+
+def test_login_asks_clearly():  # U3
+    phone, code, password = answers_to(run_script().prompts)
+    assert "country code" in phone and "bot token" not in phone
+    assert "Telegram app" in code
+    assert "two-step verification" in password
+
+
+def test_get_groupid_asks_clearly_and_prints_clean_names(tmp_path):  # U3 + U11
+    class Fake:
+        def __init__(self, *a, **k):
+            self.loop = asyncio.new_event_loop()
+
+        def start(self, **prompts):
+            self.prompts = prompts
+            return self
+
+        async def iter_dialogs(self):
+            yield SimpleNamespace(name="zz-\x1b[2JEvil\nName", id=-1001)
+
+        def disconnect(self):
+            return None
+
+    printed = []
+    path = groupid_copy(tmp_path)
+    namespace = {"__file__": str(path), "__name__": "__main__"}
+    with (
+        mock.patch.object(telethon, "TelegramClient", Fake),
+        mock.patch.dict(os.environ, ENV),
+        mock.patch(
+            "builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a)))
+        ),
+    ):
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)  # noqa: S102
+    assert any(line.endswith("Evil Name: -1001") for line in printed), printed
+    assert not any("\x1b" in line or "\n" in line.strip("\n") for line in printed)
+    phone, _code, password = answers_to(namespace["client"].prompts)
+    assert "country code" in phone and "two-step verification" in password
+
+
+def test_missing_settings_say_where_to_get_them():  # U4
+    with pytest.raises(SystemExit, match="my.telegram.org/apps"):
+        run_script(env={"API_ID": ""}, files={".env": ""})
+    with pytest.raises(SystemExit, match="copy .env.example to .env"):
+        run_script(env={"API_ID": ""})  # No .env file at all
+    with pytest.raises(SystemExit, match="--list-chats"):
+        run_script(env={"SOURCE_GROUP_IDS": ""}, files={".env": ""})
+    with pytest.raises(SystemExit, match="only digits"):
+        run_script(env={"API_ID": "zz123"})
+
+
+def test_a_wrong_chat_id_explains_what_ids_look_like():  # U4
+    with pytest.raises(SystemExit) as stopped:
+        run_script(env={"TARGET_GROUP_ID": "@zz_group"})
+    assert "-1001234567890" in str(stopped.value) and "/chats" in str(stopped.value)
+
+
+def test_names_from_telegram_are_cleaned_in_the_log():  # U11
+    # Names are set by other people: control codes could change your terminal, and a
+    # line break could fake a line of the log
+    evil = types.User(
+        id=3, first_name="zz-\x1b]0;title\x07Evil", last_name="\nFake line " + "x" * 80
+    )
+    client = run_script(names={SOURCE_A: "zz-Source A " + "y" * 80 + "\x1b[2J"})
+    send(client, msg_event(sender=evil))
+    (line,) = [line for line in client.printed() if "message from" in line]
+    assert not any(c in line for c in "\x1b\x07\n"), repr(line)
+    assert "Evil Fake line" in line and "…" in line  # Long names are shortened

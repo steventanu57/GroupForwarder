@@ -1,16 +1,30 @@
 # Run on python 3.12 or 3.13
+#
+# HOW TO CONFIGURE (all files sit next to this script; restart the forwarder after a change)
+#   .env                   Required: your login (API_ID, API_HASH from https://my.telegram.org/apps)
+#                          and the chats: SOURCE_GROUP_IDS (forward from), TARGET_GROUP_ID (forward to).
+#                          Copy .env.example to .env: it explains every value and where to find it.
+#   forwarder_config.toml  Optional: filters, more routes, forum topics, copy mode, catch-up, ...
+#                          Copy forwarder_config.example.toml: every setting is explained there.
+#   Command-line options   --list-chats, --no-login, --log FILE (see "Command-line options" below).
+# Chat IDs look like -1001234567890. See yours with "python group_forwarder.py --list-chats", or send
+# /chats to your Saved Messages while the forwarder runs (/topics <chat> shows forum topic numbers).
+# DEFAULT_OPTIONS and DEFAULT_FILTERS below are only the defaults: change settings in
+# forwarder_config.toml, not in this file.
 import asyncio
+import getpass
 import hashlib
 import html
 import json
 import os
 import sys
 import time
+import unicodedata
 from collections import deque
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, errors, events, utils
+from telethon import TelegramClient, errors, events, functions, utils
 from telethon.extensions import html as telegram_html
 from telethon.tl.functions.messages import ForwardMessagesRequest
 from telethon.tl.types import MessageMediaWebPage
@@ -62,10 +76,30 @@ if LOG_FILE:
     sys.stdout = sys.stderr = open(LOG_FILE, "a", encoding="utf-8", buffering=1)  # noqa: SIM115
 
 
+# What each .env setting is and where to get it, for the message when one is missing
+SETTING_HELP = {
+    "API_ID": "the api_id number from https://my.telegram.org/apps (log in with your phone "
+    "number, open 'API development tools' and create an app; any name works)",
+    "API_HASH": "the api_hash code from https://my.telegram.org/apps, next to the api_id",
+    "SOURCE_GROUP_IDS": "the chats to forward from, comma-separated, like "
+    "-1001234567890,-1009876543210. To see your chats and their IDs, run: "
+    "python group_forwarder.py --list-chats",
+    "TARGET_GROUP_ID": "the group that receives the messages, like -1001234567890. "
+    "To see your chats and their IDs, run: python group_forwarder.py --list-chats",
+}
+
+
 def get_setting(name):
     value = os.getenv(name, "").strip()
     if not value:
-        raise SystemExit(f"Missing {name} in .env (see .env.example)")
+        if not (BASE_DIR / ".env").exists():
+            raise SystemExit(
+                f"There is no .env file next to {Path(__file__).name}: copy .env.example "
+                "to .env and fill it in (it explains every value)."
+            )
+        raise SystemExit(
+            f"Missing {name} in .env: {SETTING_HELP[name]}. See .env.example."
+        )
     return value
 
 
@@ -77,7 +111,10 @@ def parse_chat_id(name, value):
         return int(str(value).strip())
     except ValueError:
         raise SystemExit(
-            f"{name} has '{value}', which is not a chat ID. Use the numeric IDs printed by get_groupId.py or --list-chats"
+            f"{name} has '{value}', which is not a chat ID. Chat IDs are numbers: groups and "
+            "channels look like -1001234567890. To see yours, run: python group_forwarder.py "
+            "--list-chats (or get_groupId.py), or send /chats to your Saved Messages while "
+            "the forwarder runs."
         ) from None
 
 
@@ -212,7 +249,13 @@ def read_routes(config, filters, default_route):
     return routes
 
 
-api_id = int(get_setting("API_ID"))  # Your own API id from my.telegram.org
+api_id = get_setting("API_ID")  # Your own API id from my.telegram.org
+if not api_id.isdigit():
+    raise SystemExit(
+        "API_ID in .env must be only digits: the api_id number from "
+        "https://my.telegram.org/apps (API_HASH is the long code next to it)."
+    )
+api_id = int(api_id)
 api_hash = get_setting("API_HASH")  # Your own API hash from my.telegram.org
 
 if LIST_CHATS:  # Listing your chats needs only the login, so it also works before the IDs are filled in
@@ -300,6 +343,22 @@ def now():
     return time.strftime("%H:%M:%S")  # Local time, for the log
 
 
+# Characters that turn text around on screen (could make a log line read differently)
+DIRECTION_MARKS = set("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def clean(text, limit=60):
+    """Text set by other people (chat titles, names), made safe to show: control codes and line
+    breaks become spaces, so nobody can change your terminal or fake a line of the log, and it's
+    shortened to `limit` characters."""
+    text = "".join(
+        " " if unicodedata.category(c) == "Cc" or c in DIRECTION_MARKS else c
+        for c in str(text)
+    )
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def chat_name(chat_id):
     return chat_names.get(chat_id, str(chat_id))
 
@@ -309,7 +368,7 @@ def sender_name(sender):
     # (event.get_sender() would ask Telegram again whenever it only has partial details)
     if sender is None:
         return "Unknown"
-    return utils.get_display_name(sender) or "Unknown"
+    return clean(utils.get_display_name(sender)) or "Unknown"
 
 
 def count(what):
@@ -461,6 +520,19 @@ async def attempt(send, source):
         await send()
 
 
+# The target itself refuses the post (no rights, banned, removed, topic deleted):
+# forwarding instead of copying would fail the same way
+TARGET_REFUSED = (
+    errors.ChatWriteForbiddenError,
+    errors.ChatAdminRequiredError,
+    errors.ChannelPrivateError,
+    errors.UserBannedInChannelError,
+    errors.ChatRestrictedError,
+    errors.ChatGuestSendForbiddenError,
+    errors.TopicDeletedError,
+)
+
+
 def report_failure(what, source, target, reason):
     count("failed")
     failures.append((now(), source, chat_name(target), reason))
@@ -478,7 +550,7 @@ async def deliver(incoming, route, what):
             try:
                 await attempt(lambda: copy_message(incoming, target, topic), source)
                 note = " (copied)"
-            except errors.ChatForwardsRestrictedError:
+            except (errors.ChatForwardsRestrictedError, *TARGET_REFUSED):
                 raise
             except (errors.RPCError, TypeError, ValueError) as e:
                 # Some messages can't be copied (e.g. a caption too long with the header): forward instead
@@ -625,7 +697,10 @@ def counts_text(numbers):
 def routes_text():
     lines = []
     for route in routes:
-        names = ", ".join(chat_name(chat) for chat in route["sources"])
+        names = ", ".join(
+            chat_name(chat) if chat in chat_names else f"{chat} (not in your chat list)"
+            for chat in route["sources"]
+        )
         line = f"• {names} → {chat_name(route['target'])}"
         if route["topic"]:
             line += f" (topic {route['topic']})"
@@ -663,8 +738,148 @@ HELP_TEXT = (
     "/pause - stop forwarding until /resume\n"
     "/resume - start forwarding again\n"
     "/sources - which chats go where\n"
-    "/help - this list"
+    '/chats - your chats and their IDs (/chats crypto: only chats with "crypto" in the name)\n'
+    "/topics - the topic numbers of a group with topics (/topics <chat ID or name>)\n"
+    "/help - this list\n"
+    "\n"
+    "To forward from another chat:\n"
+    "1. Send /chats and copy the chat's ID (it looks like -1001234567890).\n"
+    "2. Add it to SOURCE_GROUP_IDS in the .env file next to group_forwarder.py "
+    "(IDs separated by commas).\n"
+    "3. Then restart the forwarder.\n"
+    "Where messages go is TARGET_GROUP_ID in .env. Filters, more routes, forum topics and "
+    "the other options are in forwarder_config.toml (see forwarder_config.example.toml)."
 )
+# Telegram allows 4096 characters per message; longer replies are split below this
+SAVED_MESSAGE_LIMIT = 4000
+
+
+async def reply_in_saved(text):
+    """Sends text to your Saved Messages as plain text (so names show exactly as they are),
+    split into several messages when it's too long for one."""
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        if (
+            current
+            and utf16_length(current) + utf16_length(line) + 1 > SAVED_MESSAGE_LIMIT
+        ):
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    chunks.append(current)
+    for chunk in chunks:
+        await client.send_message("me", chunk, parse_mode=None)
+
+
+def utf16_length(text):
+    # Telegram counts message length in UTF-16 units (most emoji count as 2)
+    return len(text.encode("utf-16-le")) // 2
+
+
+def chat_kind(dialog):
+    if getattr(dialog, "is_group", False):
+        forum = getattr(getattr(dialog, "entity", None), "forum", False)
+        return "group with topics" if forum else "group"
+    return "channel" if getattr(dialog, "is_channel", False) else "private chat"
+
+
+def chats_text(dialogs, wanted):
+    """/chats: your chats with their IDs, and which ones the forwarder uses."""
+    shown = clean(wanted, 40)
+    found = [d for d in dialogs if wanted.lower() in clean(d.name).lower()]
+    if not found:
+        return f'No chat has "{shown}" in its name. Send /chats to see them all.'
+    targets = {route["target"] for route in routes}
+    title = f'Your chats with "{shown}" in the name' if wanted else "Your chats"
+    lines = [f"{title} (name: ID):"]
+    for dialog in found:
+        line = f"{clean(dialog.name)}: {dialog.id} ({chat_kind(dialog)})"
+        if dialog.id in SOURCES:
+            line += " · forwarding from it"
+        if dialog.id in targets:
+            line += " · forwarding to it"
+        lines.append(line)
+    lines.append("")
+    lines.append(
+        "To forward from a chat, add its ID to SOURCE_GROUP_IDS in .env (comma-separated), "
+        "then restart the forwarder. Send /help for all the steps."
+    )
+    return "\n".join(lines)
+
+
+TOPICS_SHOWN = 100
+
+
+def forum_topics_request(entity):
+    # Telegram moved this request: Telethon 1.45 has it under messages, older versions under channels
+    asked = {
+        "offset_date": None,
+        "offset_id": 0,
+        "offset_topic": 0,
+        "limit": TOPICS_SHOWN,
+    }
+    if hasattr(functions.messages, "GetForumTopicsRequest"):
+        return functions.messages.GetForumTopicsRequest(peer=entity, **asked)
+    return functions.channels.GetForumTopicsRequest(channel=entity, **asked)
+
+
+async def topics_text(dialogs, wanted):
+    """/topics <chat ID or part of a name>: the topic numbers of a group with topics,
+    for topic = ... in a [[routes]] section."""
+    if not wanted:
+        return (
+            "Send /topics followed by a group's ID or part of its name, e.g. "
+            '/topics -1001234567890. In /chats, groups with topics say "group with topics".'
+        )
+    shown = clean(wanted, 40)
+    try:
+        matches = [d for d in dialogs if d.id == int(wanted)]
+    except ValueError:
+        matches = [d for d in dialogs if wanted.lower() in clean(d.name).lower()]
+        with_topics = [d for d in matches if getattr(d.entity, "forum", False)]
+        matches = with_topics or matches
+    if not matches:
+        return (
+            f'No chat matches "{shown}". Send /chats to see your chats and their IDs.'
+        )
+    if len(matches) > 1:
+        lines = [f'Several chats match "{shown}". Send /topics with one of these IDs:']
+        lines += [f"{clean(d.name)}: {d.id}" for d in matches[:20]]
+        return "\n".join(lines)
+    dialog = matches[0]
+    if not getattr(dialog.entity, "forum", False):
+        return f"{clean(dialog.name)} has no topics (Topics is switched off in its settings)."
+    result = await client(forum_topics_request(dialog.entity))
+    # Deleted topics come back without a title
+    topics = [t for t in result.topics if getattr(t, "title", None)]
+    lines = [f"Topics in {clean(dialog.name)} (topic number: name):"]
+    lines += [f"{topic.id}: {clean(topic.title)}" for topic in topics]
+    if result.count > len(result.topics):
+        lines.append(f"(the first {len(result.topics)} of {result.count})")
+    lines.append("")
+    lines.append(
+        "To send a route into a topic, add topic = <number> to its [[routes]] section in "
+        "forwarder_config.toml."
+    )
+    return "\n".join(lines)
+
+
+async def lookup_command(event):
+    """/chats and /topics: the IDs and topic numbers that go into .env and
+    forwarder_config.toml, without leaving Telegram."""
+    word = event.pattern_match.group(1).lower()
+    wanted = (event.pattern_match.group(2) or "").strip()
+    print(f"[{now()}] Command /{word} from your Saved Messages")
+    try:
+        dialogs = await client.get_dialogs()
+        if word == "chats":
+            reply = chats_text(dialogs, wanted)
+        else:
+            reply = await topics_text(dialogs, wanted)
+        await reply_in_saved(reply)
+    except (errors.RPCError, ConnectionError) as e:
+        print(f"[{now()}] Couldn't answer /{word}: {type(e).__name__}: {e}")
 
 
 async def command(event):
@@ -683,7 +898,7 @@ async def command(event):
         reply = HELP_TEXT
     print(f"[{now()}] Command /{word} from your Saved Messages")
     try:
-        await client.send_message("me", reply)
+        await reply_in_saved(reply)
     except (errors.RPCError, ConnectionError) as e:
         print(f"[{now()}] Couldn't answer /{word}: {type(e).__name__}: {e}")
 
@@ -724,7 +939,7 @@ def summary_text():
 async def send_summary():
     text = summary_text()
     try:
-        await client.send_message("me", text)
+        await reply_in_saved(text)
     except (errors.RPCError, ConnectionError) as e:
         print(f"[{now()}] Couldn't send the daily summary: {type(e).__name__}: {e}")
         return
@@ -765,6 +980,13 @@ if OPTIONS["commands"]:
             pattern=r"(?i)^/(status|pause|resume|sources|help)\s*$",
         )
     )(command)
+    client.on(
+        events.NewMessage(
+            chats="me",
+            outgoing=True,
+            pattern=r"(?i)^/(chats|topics)(?:\s+(.*\S))?\s*$",
+        )
+    )(lookup_command)
 
 
 def lock_single_copy():
@@ -794,30 +1016,35 @@ if NO_LOGIN and not client.loop.run_until_complete(client.is_user_authorized()):
     raise SystemExit(
         "Not logged in. Run 'python group_forwarder.py' once in a terminal to log in, then start it again."
     )
-client.start()
+# The first start asks for your login in the terminal; later starts use the saved .session file
+LOGIN_QUESTIONS = {
+    "phone": lambda: input(
+        "Your phone number, with the country code (e.g. +44 7700 900123): "
+    ),
+    "code_callback": lambda: input(
+        "The login code Telegram just sent you (look in your Telegram app): "
+    ),
+    "password": lambda: getpass.getpass(
+        "Your Telegram two-step verification password (it isn't shown as you type): "
+    ),
+}
+client.start(**LOGIN_QUESTIONS)
 
 if LIST_CHATS:
     print("Your chats (name: ID):")
     for dialog in client.loop.run_until_complete(client.get_dialogs()):
-        kind = (
-            "channel"
-            if getattr(dialog, "is_channel", False)
-            and not getattr(dialog, "is_group", False)
-            else "group"
-            if getattr(dialog, "is_group", False)
-            else "private chat"
-        )
-        print(f"{dialog.name}: {dialog.id} ({kind})")
+        print(f"{clean(dialog.name)}: {dialog.id} ({chat_kind(dialog)})")
     print(
-        "Put the IDs you need in .env (SOURCE_GROUP_IDS, TARGET_GROUP_ID) or forwarder_config.toml."
+        "Put the IDs you need in .env (SOURCE_GROUP_IDS, TARGET_GROUP_ID) or forwarder_config.toml. "
+        "While the forwarder runs, /chats in your Saved Messages shows this list too."
     )
-    client.loop.run_until_complete(client.disconnect())
+    client.disconnect()  # With no event loop running, Telethon finishes this by itself
     raise SystemExit(0)
 
 # A fresh login has no chats cached yet, so forwarding would fail with "Could not find the input entity".
 # Loading the dialogs fills the cache (and gives us the chat names for the log); then check the chats are really reachable.
 dialogs = client.loop.run_until_complete(client.get_dialogs())
-chat_names.update({dialog.id: dialog.name for dialog in dialogs})
+chat_names.update({dialog.id: clean(dialog.name) for dialog in dialogs})
 chat_entities.update({dialog.id: getattr(dialog, "entity", None) for dialog in dialogs})
 
 # Check against the chat list: the .session file also remembers chats you have left,
@@ -826,7 +1053,8 @@ for route in routes:
     if route["target"] not in chat_names:
         raise SystemExit(
             f"{route['name']} {route['target']} isn't in your chat list (left, removed or deleted?). "
-            "Is this account still a member of that group?"
+            "Is this account still a member of that group? To see your chats, run: "
+            "python group_forwarder.py --list-chats"
         )
 
 # A source with a typo, or a chat this account has left, would otherwise be ignored without a word
@@ -865,7 +1093,8 @@ for route in routes:
         )
 if OPTIONS["commands"]:
     print(
-        "Send /status, /pause, /resume or /sources to your Saved Messages to control it."
+        "In your Saved Messages, send /help for the commands and setup steps "
+        "(/chats and /topics find chat IDs and topic numbers)."
     )
 
 if OPTIONS["catch_up"]:

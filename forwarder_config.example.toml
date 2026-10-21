@@ -51,11 +51,11 @@ skip_reposts = false     # Don't forward messages that are themselves forwarded 
 
 # Extra routes, on top of SOURCE_GROUP_IDS -> TARGET_GROUP_ID in .env.
 # Remove the # at the start of the lines to use one. Copy the block for more routes.
-# Find chat IDs with: python group_forwarder.py --list-chats
+# Find chat IDs with: python group_forwarder.py --list-chats, or /chats in your Saved Messages
 #
 # [[routes]]
 # sources = [-1001111111111, -1002222222222]   # chats to forward from
 # target = -1003333333333                      # where they go (must not also be a source anywhere)
-# topic = 12                                   # optional: a forum topic in the target (its number)
+# topic = 12                                   # optional: a forum topic in the target (/topics <target> shows the numbers)
 # include_keywords = ["btc"]                   # optional: this route's own filters; any setting
 #                                              # from [filters] can be given here, and replaces it

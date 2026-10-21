@@ -23,26 +23,29 @@
 1. It sets stdout to UTF-8, so chat names with emoji don't crash `print()` when output goes to a log file on Windows.
 2. **Command-line options:** `--list-chats`, `--no-login` and `--log FILE`. An unknown option stops it with a message. `--log` sends all output (also errors) to the file, line by line.
 3. **Settings:** it reads `.env` and the optional `forwarder_config.toml`, both from the script's own folder, so it works from any working directory.
-   - It stops with a message naming the setting if:
-     - a setting is missing
-     - a chat ID isn't a number (a typo or a `@username`)
+   - It stops with a message naming the setting, and saying how to fix it, if:
+     - there is no `.env` file (copy `.env.example`)
+     - a setting is missing (`SETTING_HELP` says what each one is and where to get it: my.telegram.org/apps for `API_ID` and `API_HASH`, `--list-chats` for chat IDs)
+     - `API_ID` isn't a number
+     - a chat ID isn't a number (a typo or a `@username`): it explains what IDs look like (`-1001234567890`) and how to see them
      - `SOURCE_GROUP_IDS` is empty
      - the config file has a syntax mistake, an unknown section or setting (a typo), or a wrong kind of value
    - **Routes:** they are the `.env` route plus any `[[routes]]`. It refuses to start if any target is also a source anywhere, since our own forwards would then be forwarded again in an endless loop.
 4. **One copy only:** it locks `group_forwarder.lock` (`msvcrt` on Windows, `fcntl` elsewhere) and stops with "Another copy … is already running" if another copy holds it. Two processes using the same `.session` get it cancelled (`AUTH_KEY_DUPLICATED`). The operating system releases the lock when the process ends, also after a crash.
 5. **Login:**
    - It connects using `group_forwarder.session`. With `--no-login` and no valid login, it stops instead of waiting for a phone number.
-   - Otherwise `client.start()` logs in. The first run asks for your phone number, the login code and, if you have one, your 2FA password.
-6. **`--list-chats`:** prints every chat as `name: ID (channel / group / private chat)`, disconnects and stops (exit code 0).
+   - Otherwise `client.start(**LOGIN_QUESTIONS)` logs in. The first run asks for your phone number with the country code, the login code Telegram sends to your Telegram app, and, if you have one, your two-step verification password. `LOGIN_QUESTIONS` replaces Telethon's own prompts, which ask for "your phone (or bot token)" and "your password".
+6. **`--list-chats`:** prints every chat as `name: ID (channel / group / group with topics / private chat)`, plus a pointer to `/chats`, disconnects and stops (exit code 0). With no event loop running, Telethon's `disconnect()` finishes by itself and returns nothing, so it isn't wrapped in `run_until_complete`.
 7. **Chat list:** it loads your chat list. A fresh login needs this before it can reach any chat; without it, forwarding fails with "Could not find the input entity". The chat list also gives the chat names for the log, and each chat's "Restrict saving content" flag. Then it checks the chats against that list (not by looking IDs up, because the `.session` file also remembers chats you have left):
    - Every route's target must be in the list, or it stops.
    - It warns about each source that isn't, and stops if none is.
-8. **Startup lines:** it prints which settings file is used (and what is switched on), then `Forwarder is running: listening to N chat(s), forwarding to <targets>` and each route. These lines only appear once all the checks have passed.
+   - Chat names are kept cleaned (see "Names in the log" below).
+8. **Startup lines:** it prints which settings file is used (and what is switched on), then `Forwarder is running: listening to N chat(s), forwarding to <targets>` and each route. These lines only appear once all the checks have passed. The last line points to `/help` (and `/chats`, `/topics`) in your Saved Messages. Nothing is posted in Telegram at startup: the auto-start task restarts it after crashes, so those messages would pile up.
 9. **Catch-up** (if on): it forwards what was missed while it was off (see below).
 10. **Daily summary** (if on): it starts the daily summary task.
 11. **Listening:** it listens for `NewMessage` and `Album` events from every route's sources, and (if `commands` is on) for commands in your Saved Messages. It runs until stopped with Ctrl+C.
 
-`get_groupId.py` is a separate helper with its own session (`groupid.session`, its own login). It prints every chat you are in with its ID. Unlike `--list-chats`, it also works while the forwarder is running.
+`get_groupId.py` is a separate helper with its own session (`groupid.session`, its own login, with the same clear login questions). It prints every chat you are in with its ID, names cleaned. Unlike `--list-chats`, it also works while the forwarder is running; so does `/chats`.
 
 ### Handling a message
 
@@ -62,7 +65,9 @@
 - **Copy:** `send_message` / `send_file`, with `📣 <b>source chat name</b>` on top and the original text's formatting kept (converted to HTML with Telethon's `html.unparse`). A topic route uses `reply_to=topic`.
   - Messages from chats or messages with "Restrict saving content" are never copied; they are reported as failed.
   - A message that can't be copied (for example, a caption that gets too long with the header) is forwarded instead, and the log says so.
-- **Log line:** each delivery prints a line like `[12:04:31] Crypto Calls -> My Feed: message from Alice` (with ` (copied)` for copies and `missed …` for catch-up). The time is local time, and the names come from the chat list and from the message itself, so no extra request is made.
+  - When the target itself refuses the post (`TARGET_REFUSED`: no right to write there, banned, removed, a deleted topic), it is reported as failed without trying a forward, which would fail the same way.
+- **Log line:** each delivery prints a line like `[12:04:31] Crypto Calls -> My Feed: message from Alice` (with ` (copied)` for copies and `missed …` for catch-up). The time is local time, and the names come from the chat list and from the message itself, so no extra request is made. Message text is never printed.
+- **Names in the log:** chat titles and senders' names are set by other people, so `clean()` turns control codes, line breaks and text-direction marks into spaces and shortens them to 60 characters. Nobody can change your terminal (window title, clearing the screen) or fake a log line through a name.
 - **Albums:** Telegram sends each photo or video separately, and each one also arrives as a `NewMessage` with a `grouped_id`. The `NewMessage` handler skips those. The `Album` handler waits about 0.5 s to collect the whole album, then handles it as one.
 
 ### Filters
@@ -94,7 +99,11 @@ Messages with neither (for example, polls) are never treated as duplicates. Fing
 
 ### Saved Messages commands and the daily summary
 
-- **Commands:** a `NewMessage` handler with `chats="me"`, `outgoing=True` and a pattern answers `/status`, `/pause`, `/resume`, `/sources` and `/help` in your Saved Messages. The pause is not saved, so a restart resumes forwarding.
+- **Commands:** a `NewMessage` handler with `chats="me"`, `outgoing=True` and a pattern answers `/status`, `/pause`, `/resume`, `/sources` and `/help` in your Saved Messages. The pause is not saved, so a restart resumes forwarding. `/sources` shows a source that isn't in your chat list as its ID with "(not in your chat list)". `/help` also has the steps to forward from another chat.
+- **Finding IDs:** a second handler (`lookup_command`) answers `/chats [part of a name]` and `/topics <chat ID or part of a name>`. Both load the chat list again (one request), so chats joined since the start are there too.
+  - `/chats` lists `name: ID (kind)` and marks "forwarding from it" / "forwarding to it".
+  - `/topics` lists a forum group's `topic number: name` (up to 100) for `topic =` in a route. Telegram moved this request: Telethon 1.45 has `messages.GetForumTopicsRequest`, older versions `channels.GetForumTopicsRequest`, and `forum_topics_request()` uses whichever exists. A name that matches several chats gets a list of IDs to choose from; a group without Topics says so.
+- **Replies:** `reply_in_saved()` sends every reply as plain text (no formatting, so names show exactly as they are) and splits it into several messages when it's longer than 4,000 characters (counted like Telegram does, in UTF-16).
 - **Counters:**
   - `totals` counts since start (for `/status`).
   - `period` counts since the last daily summary.
@@ -148,6 +157,7 @@ Its own lines in `forwarder.log` start with `run_forwarder.ps1:` and are written
 | `forwarder_config.example.toml` | Commented template for `forwarder_config.toml`; every value is the default |
 | `run_forwarder.ps1` | Restart loop for the Windows auto-start task |
 | `tests/` | Tests that run the forwarder with a fake Telegram client (no login, no network) |
+| `tests/e2e/` | End-to-end test: the forwarder with Telethon's real client on a simulated Telegram server |
 | `.env` (git-ignored) | `API_ID`, `API_HASH`, `SOURCE_GROUP_IDS`, `TARGET_GROUP_ID` |
 | `forwarder_config.toml` (git-ignored) | Your optional settings (holds chat IDs) |
 | `forwarder_state.json` (git-ignored) | Catch-up bookmarks, written while running with `catch_up` on |
@@ -198,14 +208,39 @@ They cover:
 - reconnecting forever after an outage
 - a failed forward reported without crashing, and a long rate limit waited out then retried
 - the log line with time, source and target, and the sender's name taken without an extra request
-- emoji names in a log file, for both `group_forwarder.py` and `get_groupId.py`
+- emoji names in a log file, for both `group_forwarder.py` and `get_groupId.py` (run as a copy in a temporary folder, so it never reads your `.env`)
+- names with control codes or line breaks cleaned in the log, for both scripts
 - the config file: no file, the example file, typos, wrong values, syntax mistakes, an empty file
 - routes, forum topics, filters (also per route), skipping your own messages, strict order
-- copy mode: header and formatting, albums, protected chats, falling back to a forward, topics
+- copy mode: header and formatting, albums, protected chats, falling back to a forward (but not when the target refuses), topics
 - duplicates within and after the window
 - catch-up: first run, the newest N within the hours limit, albums, service messages, no double sending, the bookmark following live messages
-- Saved Messages commands, a failed command reply, the daily summary and its timing
-- `--list-chats`, the single-copy lock, `--no-login`, unknown options, `--log`
+- Saved Messages commands (`/sources` marking a chat you've left), `/chats` (by name, long lists split, plain text), `/topics` (by ID or name, several matches, no topics), the setup steps in `/help`, a failed command reply, the daily summary and its timing
+- clear login questions, and messages for a missing `.env`, a missing setting, an `API_ID` that isn't a number, and a chat ID that isn't one
+- the startup line and `--list-chats` pointing to `/help` and `/chats`
+- `--list-chats` (ending without an error), the single-copy lock, `--no-login`, unknown options, `--log`
 - `run_forwarder.ps1` restarting after a crash but not after a quick stop (Windows only)
 
-`RecordingClient` also records the client settings (`kwargs`) and every printed line, as `("print", text)`, so tests can check the order of output and calls. Set `GF_DIR` to test a copy of the script in another folder. Test data uses the `zz-` prefix.
+`RecordingClient` also records the client settings (`kwargs`), the login questions given to `start()` (`prompts`) and every printed line, as `("print", text)`, so tests can check the order of output and calls. Its `disconnect()` behaves like Telethon's: it returns nothing when no event loop is running. `run_script(forums={chat: [(number, title)]}, names={chat: name})` sets up groups with topics and other chat names. Set `GF_DIR` to test a copy of the script in another folder. Test data uses the `zz-` prefix.
+
+### End-to-end test
+
+```
+python tests/e2e/run_e2e.py
+```
+
+This runs the real `group_forwarder.py` the way you do: start after start, each as its own process, with **Telethon's real client**. Only the network connection is replaced, by a simulated Telegram server. It needs no login and no network and touches none of your files. It takes about 5 minutes (a 61 s rate-limit wait and a daily summary), prints PASS/FAIL per check and exits with 1 if anything failed. It isn't part of `pytest`.
+
+- `telegram_sim.py`: the simulated server, under Telethon's own update handling.
+  - It answers the requests the forwarder makes: chat list, history, forwards, copies, albums, Saved Messages.
+  - It refuses what Telegram refuses: "Restrict saving content", no right to write, texts and captions too long, a missing topic, no login.
+  - Every request and answer goes through Telegram's binary format and back.
+- `play.py`: runs one plan against a copy of the script in a temporary folder:
+  - `default`: forwarding, albums, commands (also `/chats`, `/topics` and `/help`), names with control codes cleaned in the log, a 61 s rate limit
+  - `features`: every option and route, plus the daily summary
+  - `catchup`: messages posted while it was off
+  - `list`, `logfile`, `nologin`, `lefttarget`, `typo`, `second`: startup cases
+- `from_launcher.py`: lets the real `run_forwarder.ps1` start the script, with short times (Windows only).
+- `run_e2e.py`: runs all plans and prints the results.
+
+Its temporary folder is deleted when everything passed, and kept (with its path printed) when something failed.
